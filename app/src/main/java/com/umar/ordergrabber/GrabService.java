@@ -60,71 +60,151 @@ public class GrabService extends AccessibilityService {
 
     @Override public void onInterrupt() {}
 
-    // States: 0 = looking for orders, 1 = claim tapped (waiting for wallet list), 2 = wallet tapped (waiting for result)
+    // States: 0 = pick an order, 1 = claim tapped (wait wallet list), 2 = wallet tapped (wait result),
+    //         3 = failure dialog closed (wait for it to go), 4 = list refreshing (wait for new list)
     private int state = 0;
     private long stateAt = 0;
     private String walletName = "digitt";
+    private String lastTriedId = null;
+    private String topBeforeRefresh = null;
+    private final java.util.LinkedHashSet<String> failedIds = new java.util.LinkedHashSet<>();
 
-    private static final String[] FAIL_WORDS = {"already been claimed", "claim failed", "order failed", "failed"};
+    private static final Pattern ORDER_ID = Pattern.compile("[0-9]{2,}\\*+[A-Za-z0-9]+");
+    private static final String[] FAIL_WORDS = {"already been claimed", "claimed by someone", "claim failed", "order failed", "failed"};
     private static final String[] OK_WORDS = {"order get", "order got", "success", "successful", "claimed successfully"};
 
     private void setState(int s, long now) { state = s; stateAt = now; }
+
+    private boolean failureShowing(AccessibilityNodeInfo root) {
+        for (String w : FAIL_WORDS) if (hasText(root, w)) return true;
+        return false;
+    }
 
     private void tick() {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return;
         long now = SystemClock.uptimeMillis();
 
-        for (String w : FAIL_WORDS) {
-            if (hasText(root, w)) {
-                AccessibilityNodeInfo done = findClickableByText(root, DONE);
-                if (done == null) done = findClickableByText(root, "ok");
-                if (done != null) done.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                setState(0, now);
-                lastRefresh = 0;
-                return;
+        if (state != 3 && failureShowing(root)) {
+            if (lastTriedId != null) {
+                failedIds.add(lastTriedId);
+                if (failedIds.size() > 300) failedIds.remove(failedIds.iterator().next());
             }
-        }
-
-        if (state == 2) {
-            for (String w : OK_WORDS) if (hasText(root, w)) { success(); return; }
-            if (now - stateAt > 4000) { success(); return; }
+            AccessibilityNodeInfo done = findClickableByText(root, DONE);
+            if (done == null) done = findClickableByText(root, "ok");
+            if (done != null) done.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+            setState(3, now);
             return;
         }
 
-        if (state == 1) {
-            AccessibilityNodeInfo wallet = findWallet(root);
-            if (wallet != null) {
-                wallet.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                setState(2, now);
+        switch (state) {
+            case 3:
+                if (failureShowing(root)) {
+                    if (now - stateAt > 600) {
+                        AccessibilityNodeInfo done = findClickableByText(root, DONE);
+                        if (done == null) done = findClickableByText(root, "ok");
+                        if (done != null) done.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                        stateAt = now;
+                    }
+                    return;
+                }
+                startRefresh(root, now);
+                return;
+
+            case 4: {
+                if (now - stateAt < 250) return;
+                String top = topOrderId(root);
+                boolean changed = top != null && !top.equals(topBeforeRefresh);
+                if (changed || now - stateAt > Math.max(1200, intervalMs * 3)) setState(0, now);
+                else return;
+                break;
+            }
+
+            case 1: {
+                AccessibilityNodeInfo wallet = findWallet(root);
+                if (wallet != null) {
+                    wallet.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                    setState(2, now);
+                } else if (now - stateAt > 2500) {
+                    startRefresh(root, now);
+                }
                 return;
             }
-            if (now - stateAt > 2500) setState(0, now);
-            return;
+
+            case 2:
+                for (String w : OK_WORDS) if (hasText(root, w)) { success(); return; }
+                if (now - stateAt > 4000) { success(); return; }
+                return;
         }
 
         List<AccessibilityNodeInfo> claims = findAllByText(root, CLAIM);
         AccessibilityNodeInfo best = null;
+        String bestId = null;
         int bestTop = Integer.MAX_VALUE;
         for (AccessibilityNodeInfo c : claims) {
             AccessibilityNodeInfo btn = clickableSelfOrParent(c);
             if (btn == null || !btn.isEnabled() || !c.isEnabled()) continue;
-            double amt = amountForCard(c);
+            String card = cardText(c);
+            String id = orderId(card);
+            if (id != null && failedIds.contains(id)) continue;
+            double amt = amount(card);
             if (amt > 0 && amt > maxAmount) continue;
             android.graphics.Rect r = new android.graphics.Rect();
             btn.getBoundsInScreen(r);
-            if (r.top < bestTop && r.height() > 0) { bestTop = r.top; best = btn; }
+            if (r.top < bestTop && r.height() > 0) { bestTop = r.top; best = btn; bestId = id; }
         }
         if (best != null) {
             best.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+            lastTriedId = bestId;
             setState(1, now);
             return;
         }
 
-        if (now - lastRefresh >= intervalMs) {
-            lastRefresh = now;
-            pullToRefresh();
+        if (now - lastRefresh >= intervalMs) startRefresh(root, now);
+    }
+
+    private void startRefresh(AccessibilityNodeInfo root, long now) {
+        topBeforeRefresh = topOrderId(root);
+        lastRefresh = now;
+        pullToRefresh();
+        setState(4, now);
+    }
+
+    private String topOrderId(AccessibilityNodeInfo root) {
+        String bestId = null;
+        int bestTop = Integer.MAX_VALUE;
+        for (AccessibilityNodeInfo c : findAllByText(root, CLAIM)) {
+            android.graphics.Rect r = new android.graphics.Rect();
+            c.getBoundsInScreen(r);
+            if (r.top < bestTop) { bestTop = r.top; bestId = orderId(cardText(c)); }
         }
+        return bestId;
+    }
+
+    private String cardText(AccessibilityNodeInfo claim) {
+        AccessibilityNodeInfo n = claim;
+        for (int up = 0; up < 6 && n != null; up++) {
+            n = n.getParent();
+            if (n == null) break;
+            String t = collectText(n, 0);
+            if (AMOUNT.matcher(t).find()) return t;
+        }
+        return "";
+    }
+
+    private String orderId(String card) {
+        Matcher m = ORDER_ID.matcher(card);
+        if (!m.find()) return null;
+        Matcher a = AMOUNT.matcher(card);
+        return m.group() + (a.find() ? "|" + a.group(1) : "");
+    }
+
+    private double amount(String card) {
+        Matcher m = AMOUNT.matcher(card);
+        if (m.find()) {
+            try { return Double.parseDouble(m.group(1).replace(",", "")); } catch (Exception ignored) {}
+        }
+        return -1;
     }
 
     private AccessibilityNodeInfo findWallet(AccessibilityNodeInfo root) {
@@ -152,20 +232,6 @@ public class GrabService extends AccessibilityService {
         GestureDescription g = new GestureDescription.Builder()
                 .addStroke(new GestureDescription.StrokeDescription(p, 0, 120)).build();
         dispatchGesture(g, null, null);
-    }
-
-    private double amountForCard(AccessibilityNodeInfo claim) {
-        AccessibilityNodeInfo n = claim;
-        for (int up = 0; up < 6 && n != null; up++) {
-            n = n.getParent();
-            if (n == null) break;
-            String t = collectText(n, 0);
-            Matcher m = AMOUNT.matcher(t);
-            if (m.find()) {
-                try { return Double.parseDouble(m.group(1).replace(",", "")); } catch (Exception ignored) {}
-            }
-        }
-        return -1;
     }
 
     private String collectText(AccessibilityNodeInfo n, int depth) {
@@ -265,6 +331,8 @@ public class GrabService extends AccessibilityService {
         running = true;
         state = 0;
         lastRefresh = 0;
+        lastTriedId = null;
+        failedIds.clear();
         button.setText("STOP");
         button.setBackgroundColor(Color.rgb(40, 40, 40));
         h.post(loop);
