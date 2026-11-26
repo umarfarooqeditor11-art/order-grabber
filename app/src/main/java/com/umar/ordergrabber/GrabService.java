@@ -36,8 +36,6 @@ public class GrabService extends AccessibilityService {
     private boolean running = false;
 
     private long lastRefresh = 0;
-    private long lastClaimAt = 0;
-    private boolean awaitingResult = false;
 
     private int maxAmount = 500;
     private int intervalMs = 200;
@@ -62,30 +60,50 @@ public class GrabService extends AccessibilityService {
 
     @Override public void onInterrupt() {}
 
+    // States: 0 = looking for orders, 1 = claim tapped (waiting for wallet list), 2 = wallet tapped (waiting for result)
+    private int state = 0;
+    private long stateAt = 0;
+    private String walletName = "digitt";
+
+    private static final String[] FAIL_WORDS = {"already been claimed", "claim failed", "order failed", "failed"};
+    private static final String[] OK_WORDS = {"order get", "order got", "success", "successful", "claimed successfully"};
+
+    private void setState(int s, long now) { state = s; stateAt = now; }
+
     private void tick() {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return;
         long now = SystemClock.uptimeMillis();
 
-        if (hasText(root, "already been claimed") || hasText(root, "claim failed")) {
-            AccessibilityNodeInfo done = findClickableByText(root, DONE);
-            if (done != null) done.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-            awaitingResult = false;
-            lastRefresh = 0;
+        for (String w : FAIL_WORDS) {
+            if (hasText(root, w)) {
+                AccessibilityNodeInfo done = findClickableByText(root, DONE);
+                if (done == null) done = findClickableByText(root, "ok");
+                if (done != null) done.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                setState(0, now);
+                lastRefresh = 0;
+                return;
+            }
+        }
+
+        if (state == 2) {
+            for (String w : OK_WORDS) if (hasText(root, w)) { success(); return; }
+            if (now - stateAt > 4000) { success(); return; }
+            return;
+        }
+
+        if (state == 1) {
+            AccessibilityNodeInfo wallet = findWallet(root);
+            if (wallet != null) {
+                wallet.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                setState(2, now);
+                return;
+            }
+            if (now - stateAt > 2500) setState(0, now);
             return;
         }
 
         List<AccessibilityNodeInfo> claims = findAllByText(root, CLAIM);
-
-        if (awaitingResult) {
-            if (now - lastClaimAt > 700 && claims.isEmpty()) {
-                success();
-                return;
-            }
-            if (now - lastClaimAt < 1500) return;
-            awaitingResult = false;
-        }
-
         AccessibilityNodeInfo best = null;
         int bestTop = Integer.MAX_VALUE;
         for (AccessibilityNodeInfo c : claims) {
@@ -99,8 +117,7 @@ public class GrabService extends AccessibilityService {
         }
         if (best != null) {
             best.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-            lastClaimAt = now;
-            awaitingResult = true;
+            setState(1, now);
             return;
         }
 
@@ -108,6 +125,15 @@ public class GrabService extends AccessibilityService {
             lastRefresh = now;
             pullToRefresh();
         }
+    }
+
+    private AccessibilityNodeInfo findWallet(AccessibilityNodeInfo root) {
+        if (walletName.isEmpty()) return null;
+        for (AccessibilityNodeInfo n : findAllByText(root, walletName)) {
+            AccessibilityNodeInfo c = clickableSelfOrParent(n);
+            if (c != null && c.isEnabled()) return c;
+        }
+        return null;
     }
 
     private void success() {
@@ -235,8 +261,9 @@ public class GrabService extends AccessibilityService {
         SharedPreferences p = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
         maxAmount = p.getInt(MainActivity.KEY_MAX, 500);
         intervalMs = Math.max(100, p.getInt(MainActivity.KEY_INTERVAL, 200));
+        walletName = p.getString(MainActivity.KEY_WALLET, "Digitt").trim().toLowerCase();
         running = true;
-        awaitingResult = false;
+        state = 0;
         lastRefresh = 0;
         button.setText("STOP");
         button.setBackgroundColor(Color.rgb(40, 40, 40));
